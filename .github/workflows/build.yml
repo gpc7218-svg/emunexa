@@ -39,7 +39,7 @@ jobs:
       - name: Create NSIS installer script
         run: |
           Set-Content -Path "build/installer.nsi" -Value @'
-!include "MUI2.nsh"
+include "MUI2.nsh"
 Name "EmuNexa"
 OutFile "dist/EmuNexa-Setup-1.0.0-windows-x64.exe"
 InstallDir "$PROGRAMFILES\EmuNexa"
