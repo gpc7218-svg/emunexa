@@ -1,0 +1,193 @@
+name: Build EmuNexa
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 1.0.0)'
+        required: false
+        type: string
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Install NSIS
+        uses: ashutoshvarma/setup-nsis@v1
+        with:
+          version: '3.09'
+
+      - name: Determine version
+        id: version
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) {
+            $tag = "${{ github.ref_name }}"
+            if ($tag -match '^v(.+)$') { $version = $matches[1] }
+            else { $version = "0.0.0-dev.$(git rev-parse --short HEAD)" }
+          }
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build backend
+        env:
+          APP_VERSION: ${{ env.VERSION }}
+          GIT_COMMIT: ${{ github.sha }}
+          BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.workflow_run.created_at }}
+        run: |
+          $ldflags = "-s -w -X github.com/emunexa/emunexa/cmd/emu-nexa.Version=${{ env.VERSION }} -X github.com/emunexa/emunexa/cmd/emu-nexa.Commit=${{ github.sha }} -X github.com/emunexa/emunexa/cmd/emu-nexa.BuildDate=$(Get-Date -Format 'yyyy-MM-dd')"
+          wails build -ldflags "$ldflags" -tags production
+
+      - name: Verify executable
+        run: |
+          $exe = "build/EmuNexa.exe"
+          if (-not (Test-Path $exe)) { throw "Executable not found" }
+          & $exe --version
+
+      - name: Create portable package
+        run: |
+          $portableDir = "dist/portable"
+          if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
+          New-Item -ItemType Directory -Path $portableDir | Out-Null
+          Copy-Item "build/EmuNexa.exe" "$portableDir/" -Force
+          Copy-Item "frontend/dist" "$portableDir/" -Recurse -Force
+          @"
+EmuNexa Portable Edition v${{ env.VERSION }}
+==========================================
+
+Portable version - no installation required.
+
+Requirements:
+- Windows 10 2004+ or Windows 11 (64-bit)
+- WebView2 Runtime (usually pre-installed on Windows 11)
+- QEMU with WHPX support for hardware acceleration
+
+To run: Double-click EmuNexa.exe
+"@ | Set-Content "$portableDir/README.txt" -Encoding UTF8
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "dist/EmuNexa-Portable-${{ env.VERSION }}-windows-x64.zip" -Force
+
+      - name: Create NSIS installer
+        run: |
+          $nsisScript = @"
+!include "MUI2.nsh"
+Name "EmuNexa"
+OutFile "dist/EmuNexa-Setup-${{ env.VERSION }}-windows-x64.exe"
+InstallDir "\$PROGRAMFILES\EmuNexa"
+InstallDirRegKey HKCU "Software\EmuNexa" ""
+RequestExecutionLevel admin
+!define MUI_ICON "build/icon.ico"
+!define MUI_UNICON "build/icon.ico"
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "LICENSE"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+!insertmacro MUI_UNPAGE_WELCOME
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
+Section "MainSection" SEC01
+    SetOutPath "\$INSTDIR"
+    File /r "build\EmuNexa.exe"
+    File /r "frontend\dist\*"
+    WriteRegStr HKCU "Software\EmuNexa" "" "\$INSTDIR"
+    WriteUninstaller "\$INSTDIR\Uninstall.exe"
+    CreateDirectory "\$SMPROGRAMS\EmuNexa"
+    CreateShortCut "\$SMPROGRAMS\EmuNexa\EmuNexa.lnk" "\$INSTDIR\EmuNexa.exe"
+    CreateShortCut "\$DESKTOP\EmuNexa.lnk" "\$INSTDIR\EmuNexa.exe"
+SectionEnd
+Section "Uninstall"
+    Delete "\$INSTDIR\EmuNexa.exe"
+    RMDir /r "\$INSTDIR"
+    Delete "\$SMPROGRAMS\EmuNexa\EmuNexa.lnk"
+    Delete "\$DESKTOP\EmuNexa.lnk"
+    RMDir "\$SMPROGRAMS\EmuNexa"
+    DeleteRegKey HKCU "Software\EmuNexa"
+SectionEnd
+"@
+          $scriptPath = "build/installer.nsi"
+          $nsisScript | Set-Content $scriptPath -Encoding UTF8
+          $nsisPath = "${env:ProgramFiles}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsisPath)) { $nsisPath = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          & $nsisPath $scriptPath
+
+      - name: Generate checksums
+        run: |
+          $files = Get-ChildItem dist/*.exe, dist/*.zip
+          foreach ($file in $files) {
+            $sha256 = Get-FileHash -Algorithm SHA256 $file.FullName
+            echo "$($sha256.Hash)  $($file.Name)" | Out-File -Append -Encoding UTF8 dist/checksums.txt
+          }
+          Get-Content dist/checksums.txt
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: EmuNexa v${{ env.VERSION }}
+          draft: false
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          files: |
+            dist/EmuNexa-Setup-${{ env.VERSION }}-windows-x64.exe
+            dist/EmuNexa-Portable-${{ env.VERSION }}-windows-x64.zip
+            dist/checksums.txt
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: emunexa-windows-x64-${{ env.VERSION }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/checksums*.txt
+          retention-days: 30
